@@ -4,22 +4,24 @@ dxf2geojson.exeは、Potree などのソフトウェアで作成した平面直�
 # 使用方法
 ## プログラムの準備
 dxf2geojson.exe をダウンロードしてデスクトップなど、分かりやすい場所に保存します（インストールは不要です）。
-![スクリーンショット 2024-12-16 191628](https://github.com/user-attachments/assets/162b2f6d-4a9e-4540-82e4-43504c117d53)
+<img width="761" alt="Download" src="https://github.com/user-attachments/assets/992cbb37-eedd-428c-80aa-11578de0c69f" />
 
 
 ## 3次元ポリゴンデータの作成（例として PotreeDesktop）
 平面直角座標系で作成された点群（LAS/LAZ）をPotreeDesktopに読み込みます。
 PotreeDesktopで3次元ポリゴンを作成し、DXFファイルとして出力します。
-![スクリーンショット 2024-12-16 181831](https://github.com/user-attachments/assets/c6c93b26-b3fb-46c0-b281-66d0bd02d09c)
+![potree](https://github.com/user-attachments/assets/8535c3cd-20be-4f56-9db3-e5177cbe5f43)
+
 
 ## DXFファイルの変換
 出力したDXFファイルを dxf2geojson.exe にドラッグ＆ドロップします。
-表示されたダイアログで、対応するEPSGコードを選択します（例: 茨城県 = EPSG:6677）。
-「OK」ボタンを押します。
-![スクリーンショット 2024-12-16 183105](https://github.com/user-attachments/assets/5fdc5333-ccc1-4018-9c14-2fbbd1f3830f)
+表示されたダイアログで、インポートとエクスポートのオプションを選択します（例: 入力ファイルオプション = 茨城県:EPSG 6677, 出力ファイルオプション = WGS84:EPSG 4326）。
+![exportOption](https://github.com/user-attachments/assets/193f2b7d-3bd3-465e-b93b-3e6a2d3aa70d)
+<img width="504" alt="importOption" src="https://github.com/user-attachments/assets/844bf7eb-a155-4d64-b0f6-68a365e8af3d" />
 
 
 ## 変換後のgeojsonファイル
 dxfファイルと同じディレクトリに、geojson形式 に変換された3次元ポリゴンデータが保存されます。
 QGIなど一般的なGISソフトウェアで読込・表示が可能です。
-![スクリーンショット 2024-12-16 183854](https://github.com/user-attachments/assets/c10190c6-105f-4085-9752-fa1de4f75b52)
+![qgis](https://github.com/user-attachments/assets/37b29526-0bca-4de3-99b1-8d6f3c0c3a74)
+
