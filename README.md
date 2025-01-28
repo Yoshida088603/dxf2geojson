@@ -1,0 +1,2 @@
+# dxf2geojson
+Potreeなどから出力した平面直角座標系のDXFファイルをgeojsonに変換します
