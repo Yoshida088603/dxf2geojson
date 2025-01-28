@@ -1,0 +1,292 @@
+"""
+DXF to GeoJSON Converter (JGD2011 to Web Mercator)
+Version: 1.2
+License: MIT
+"""
+
+import os
+import sys
+import logging
+import datetime
+import tkinter as tk
+from tkinter import ttk
+from typing import List, Dict, Any
+
+import ezdxf
+from ezdxf.document import Drawing
+from ezdxf.entities import DXFEntity
+import geopandas as gpd
+from shapely.geometry import Point, LineString, Polygon, MultiPolygon, shape
+from shapely.ops import orient
+from pyproj import Transformer
+import geojson
+
+# 定数定義
+DEFAULT_EPSG = 6677  # 東京を含む第9系
+OUTPUT_CRS = "EPSG:3857"
+SUPPORTED_ENTITIES = {"POINT", "LWPOLYLINE", "POLYLINE", "CIRCLE", "ARC", "LINE"}
+
+#########################
+# ログ設定
+#########################
+def setup_logging() -> None:
+    """ログシステムの初期化"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(script_dir, 'logs')
+    
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except PermissionError as e:
+        log_dir = os.path.join(os.getcwd(), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        logging.warning(f"デフォルトログディレクトリを使用: {log_dir}")
+
+    current_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f'dxf2geojson_{current_time}.log')
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logging.info("=== DXF to GeoJSON Converter ===")
+    logging.info(f"ログファイル: {log_file}")
+
+#########################
+# EPSG選択ダイアログ
+#########################
+class EPSGSelector:
+    """平面直角座標系選択用GUI"""
+    
+    EPSG_OPTIONS = {
+        1: (6669, "長崎県、鹿児島県の一部"),
+        2: (6670, "福岡県、佐賀県、熊本県、大分県、宮崎県、鹿児島県の一部"),
+        3: (6671, "山口県、島根県、広島県"),
+        4: (6672, "香川県、愛媛県、徳島県、高知県"),
+        5: (6673, "兵庫県、鳥取県、岡山県"),
+        6: (6674, "京都府、大阪府、福井県、滋賀県、三重県、奈良県、和歌山県"),
+        7: (6675, "石川県、富山県、岐阜県、愛知県"),
+        8: (6676, "新潟県、長野県、山梨県、静岡県"),
+        9: (6677, "東京都、福島県、栃木県、茨城県、埼玉県、千葉県、群馬県、神奈川県"),
+        10: (6678, "青森県、秋田県、山形県、岩手県、宮城県"),
+        11: (6679, "北海道の一部（小樽市、函館市など）"),
+        12: (6680, "北海道の一部"),
+        13: (6681, "北海道の一部（北見市、帯広市など）"),
+        14: (6682, "東京都の一部（南方諸島）"),
+        15: (6683, "沖縄県の一部"),
+        16: (6684, "沖縄県の一部"),
+        17: (6685, "沖縄県の一部"),
+        18: (6686, "東京都の一部（南方諸島）"),
+        19: (6687, "東京都の一部（南方諸島）")
+    }
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("座標系選択")
+        self.selected_epsg = DEFAULT_EPSG
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        """GUIコンポーネントの初期化"""
+        frame = ttk.Frame(self.root, padding=10)
+        frame.grid(row=0, column=0, sticky=tk.NSEW)
+
+        label = ttk.Label(frame, text="DXFファイルの平面直角座標系を選択してください:")
+        label.grid(row=0, column=0, sticky=tk.W, pady=5)
+
+        # 表示用の選択肢を作成
+        options = [f"第{code}系: {desc}" for code, (_, desc) in self.EPSG_OPTIONS.items()]
+        self.combo_var = tk.StringVar(value=options[8])  # デフォルト第9系
+        combo = ttk.Combobox(frame, textvariable=self.combo_var, values=options, 
+                           state="readonly", width=60)
+        combo.grid(row=1, column=0, padx=5, pady=5)
+
+        ttk.Button(frame, text="OK", command=self._on_ok).grid(row=2, column=0, pady=10)
+
+    def _on_ok(self) -> None:
+        """OKボタン処理"""
+        selected = self.combo_var.get()
+        # "第X系: 説明" から系番号を取得
+        system_number = int(selected.split("第")[1].split("系")[0])
+        self.selected_epsg = self.EPSG_OPTIONS[system_number][0]  # EPSGコードを取得
+        self.root.destroy()
+
+    def get_epsg(self) -> int:
+        """選択されたEPSGコードを取得"""
+        self.root.mainloop()
+        return self.selected_epsg
+
+#########################
+# DXF処理モジュール
+#########################
+class DXFProcessor:
+    """DXFファイルの読み込みとジオメトリ変換"""
+    
+    def __init__(self, dxf_path: str):
+        self.dxf_path = dxf_path
+        self.doc: Drawing = ezdxf.readfile(dxf_path)
+        self.msp = self.doc.modelspace()
+        self.features: List[Dict[str, Any]] = []
+
+    def _process_entity(self, entity: DXFEntity) -> None:
+        """個々のDXFエンティティを処理"""
+        try:
+            dxftype = entity.dxftype()
+            if dxftype not in SUPPORTED_ENTITIES:
+                return
+
+            geom = None
+            prop = {
+                "layer": entity.dxf.layer,
+                "color": entity.dxf.color,
+                "dxftype": dxftype
+            }
+
+            if dxftype == "POINT":
+                geom = self._extract_point(entity)
+            elif dxftype in {"LWPOLYLINE", "POLYLINE"}:
+                geom = self._extract_polyline(entity)
+            elif dxftype == "LINE":
+                geom = self._extract_line(entity)
+            elif dxftype in {"CIRCLE", "ARC"}:
+                geom = self._extract_curve(entity)
+
+            if geom and geom.is_valid:
+                self.features.append({"geometry": geom, "properties": prop})
+
+        except Exception as e:
+            logging.error(f"エンティティ処理エラー: {str(e)}")
+
+    def _extract_point(self, entity) -> Point:
+        """POINTエンティティの抽出"""
+        loc = entity.dxf.location
+        return Point(loc.x, loc.y, loc.z)
+
+    def _extract_polyline(self, entity) -> Any:
+        """POLYLINE/LWPOLYLINE処理"""
+        points = []
+        z = entity.dxf.elevation if hasattr(entity, 'elevation') else 0.0
+
+        for vertex in entity.vertices:
+            x, y = vertex.dxf.location.x, vertex.dxf.location.y
+            points.append((x, y, vertex.dxf.location.z if vertex.dxf.hasattr('z') else z))
+
+        if entity.is_closed:
+            return Polygon(points)
+        return LineString(points)
+
+    def _extract_line(self, entity) -> LineString:
+        """LINEエンティティ処理"""
+        start = entity.dxf.start
+        end = entity.dxf.end
+        return LineString([(start.x, start.y, start.z), (end.x, end.y, end.z)])
+
+    def process(self) -> List[Dict[str, Any]]:
+        """全エンティティの処理"""
+        logging.info(f"DXF処理開始: {self.dxf_path}")
+        for entity in self.msp:
+            self._process_entity(entity)
+        logging.info(f"抽出ジオメトリ数: {len(self.features)}")
+        return self.features
+
+#########################
+# 座標変換モジュール
+#########################
+class CoordinateTransformer:
+    """座標変換処理を管理"""
+    
+    def __init__(self, src_epsg: int):
+        self.src_epsg = src_epsg
+        self.transformer = Transformer.from_crs(
+            f"EPSG:{src_epsg}", 
+            OUTPUT_CRS, 
+            always_xy=True
+        )
+
+    def transform_geometry(self, geometry):
+        """ジオメトリの座標変換"""
+        try:
+            if geometry.is_empty:
+                return geometry
+            
+            # 3次元座標変換
+            def transform_coords(coords):
+                x, y, *z = zip(*coords)
+                z = z[0] if z else [0]*len(x)
+                new_x, new_y = self.transformer.transform(x, y)
+                return list(zip(new_x, new_y, z))
+
+            if isinstance(geometry, Point):
+                x, y = self.transformer.transform(geometry.x, geometry.y)
+                return Point(x, y, geometry.z)
+            
+            elif isinstance(geometry, LineString):
+                return LineString(transform_coords(geometry.coords))
+            
+            elif isinstance(geometry, Polygon):
+                exterior = transform_coords(geometry.exterior.coords)
+                interiors = [transform_coords(ring.coords) for ring in geometry.interiors]
+                return Polygon(exterior, interiors)
+            
+            return geometry
+        
+        except Exception as e:
+            logging.error(f"座標変換エラー: {str(e)}")
+            return geometry
+
+#########################
+# メイン処理
+#########################
+def main():
+    setup_logging()
+    
+    try:
+        # 入力チェック
+        if len(sys.argv) < 2:
+            raise ValueError("DXFファイルをドラッグアンドドロップしてください")
+        
+        dxf_path = sys.argv[1]
+        if not os.path.isfile(dxf_path):
+            raise FileNotFoundError(f"ファイルが見つかりません: {dxf_path}")
+
+        # EPSG選択
+        epsg = EPSGSelector().get_epsg()
+        logging.info(f"選択座標系: EPSG:{epsg}")
+
+        # DXF処理
+        processor = DXFProcessor(dxf_path)
+        features = processor.process()
+        if not features:
+            raise ValueError("有効なジオメトリが見つかりませんでした")
+
+        # GeoDataFrame作成
+        gdf = gpd.GeoDataFrame(
+            [f['properties'] for f in features],
+            geometry=[f['geometry'] for f in features],
+            crs=f"EPSG:{epsg}"
+        )
+
+        # 座標変換
+        transformer = CoordinateTransformer(epsg)
+        gdf['geometry'] = gdf['geometry'].apply(transformer.transform_geometry)
+
+        # ジオメトリ修復
+        gdf['geometry'] = gdf['geometry'].apply(
+            lambda g: orient(g, sign=1.0) if isinstance(g, (Polygon, MultiPolygon)) else g
+        )
+        gdf['geometry'] = gdf['geometry'].buffer(0)
+
+        # 出力
+        output_path = os.path.splitext(dxf_path)[0] + "_web_mercator.geojson"
+        gdf.to_file(output_path, driver='GeoJSON', encoding='utf-8')
+        logging.info(f"出力完了: {output_path}")
+
+    except Exception as e:
+        logging.critical(f"致命的エラー: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
