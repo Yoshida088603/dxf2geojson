@@ -3,7 +3,7 @@ dxf2geojson.exeは、Potree などのソフトウェアで作成した平面直�
 
 # 使用方法
 ## プログラムの準備
-dxf2geojson.exe をダウンロードしてデスクトップなど、分かりやすい場所に保存します（インストールは不要です）。
+dxf2geojson.exe をダウンロードしてデスクトップなど、分かりやすい場所に保存します（インストール不要）。
 <img width="761" alt="Download" src="https://github.com/user-attachments/assets/992cbb37-eedd-428c-80aa-11578de0c69f" />
 
 
