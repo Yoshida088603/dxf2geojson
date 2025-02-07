@@ -10,8 +10,9 @@ import logging
 import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import time
+import math
 
 import ezdxf
 from ezdxf.document import Drawing
@@ -225,15 +226,28 @@ class DXFProcessor:
 
             if dxftype == "POINT":
                 geom = self._extract_point(entity)
+                if geom:
+                    self.features.append({
+                        "type": "Feature",
+                        "geometry": mapping(geom),
+                        "properties": prop
+                    })
             elif dxftype in {"LWPOLYLINE", "POLYLINE"}:
-                geom = self._extract_polyline(entity)
+                feature = self._extract_polyline(entity)
+                if feature:
+                    self.features.append(feature)
             elif dxftype == "LINE":
                 geom = self._extract_line(entity)
+                if geom:
+                    self.features.append({
+                        "type": "Feature",
+                        "geometry": mapping(geom),
+                        "properties": prop
+                    })
             elif dxftype in {"CIRCLE", "ARC"}:
-                geom = self._extract_curve(entity)
-
-            if geom and geom.is_valid:
-                self.features.append({"geometry": geom, "properties": prop})
+                feature = self._extract_curve(entity)
+                if feature:
+                    self.features.append(feature)
 
         except Exception as e:
             logging.error(f"エンティティ処理エラー: {str(e)}")
@@ -243,24 +257,180 @@ class DXFProcessor:
         loc = entity.dxf.location
         return Point(loc.x, loc.y, loc.z)
 
-    def _extract_polyline(self, entity) -> Any:
+    def _extract_polyline(self, entity) -> Optional[Dict[str, Any]]:
         """POLYLINE/LWPOLYLINE処理"""
-        points = []
-        z = entity.dxf.elevation if hasattr(entity, 'elevation') else 0.0
+        try:
+            coords_3d = []
+            dxftype = entity.dxftype()
+            logging.info(f"[高さ追跡] 処理開始: エンティティタイプ = {dxftype}")
 
-        for vertex in entity.vertices:
-            x, y = vertex.dxf.location.x, vertex.dxf.location.y
-            points.append((x, y, vertex.dxf.location.z if vertex.dxf.hasattr('z') else z))
+            # エンティティの基準高さを取得
+            base_elevation = 0.0
+            if hasattr(entity.dxf, 'elevation'):
+                if isinstance(entity.dxf.elevation, (int, float)):
+                    base_elevation = float(entity.dxf.elevation)
+                elif hasattr(entity.dxf.elevation, 'z'):
+                    base_elevation = float(entity.dxf.elevation.z)
+                elif isinstance(entity.dxf.elevation, (list, tuple)):
+                    base_elevation = float(entity.dxf.elevation[2])  # Z座標を取得
+            logging.info(f"[高さ追跡] 基準高さ: {base_elevation}")
 
-        if entity.is_closed:
-            return Polygon(points)
-        return LineString(points)
+            # POLYLINE/LWPOLYLINEの処理
+            if dxftype == "LWPOLYLINE":
+                for point in entity.get_points():
+                    x, y = point[:2]
+                    # 高さ情報を取得（bulge情報がある場合は除外）
+                    z = point[2] if len(point) > 2 and not isinstance(point[2], (bool, int)) else base_elevation
+                    coords_3d.append([float(x), float(y), float(z)])
+                    logging.info(f"[高さ追跡] LWPOLYLINE頂点: x={x}, y={y}, z={z}")
+            
+            elif dxftype == "POLYLINE":
+                for vertex in entity.vertices:
+                    if not hasattr(vertex.dxf, 'location'):
+                        continue
+                    loc = vertex.dxf.location
+                    x = float(loc.x)
+                    y = float(loc.y)
+                    # Z座標の取得を試みる（複数の方法）
+                    if hasattr(loc, 'z'):
+                        z = float(loc.z)
+                    elif hasattr(vertex.dxf, 'elevation'):
+                        z = float(vertex.dxf.elevation)
+                    else:
+                        z = base_elevation
+                    coords_3d.append([x, y, z])
+                    logging.info(f"[高さ追跡] POLYLINE頂点: x={x}, y={y}, z={z}")
+
+            if not coords_3d:
+                logging.warning(f"[高さ追跡] 有効な座標が取得できませんでした: {dxftype}")
+                return None
+
+            # 重複頂点の除去（数値誤差を考慮）
+            unique_coords = []
+            for coord in coords_3d:
+                if not unique_coords or not all(abs(a - b) < 1e-8 for a, b in zip(coord, unique_coords[-1])):
+                    unique_coords.append(coord)
+
+            # ポリゴンクローズの処理
+            is_closed = False
+            if hasattr(entity.dxf, 'flags'):
+                is_closed = bool(entity.dxf.flags & 1)
+            elif hasattr(entity, 'closed'):
+                is_closed = entity.closed
+
+            if is_closed and len(unique_coords) >= 3:
+                if not all(abs(a - b) < 1e-8 for a, b in zip(unique_coords[0], unique_coords[-1])):
+                    unique_coords.append(unique_coords[0].copy())
+
+            # 高さの統計情報を計算
+            z_values = [coord[2] for coord in unique_coords]
+            z_stats = {
+                "min_z": min(z_values),
+                "max_z": max(z_values),
+                "avg_z": sum(z_values) / len(z_values)
+            }
+            
+            # GeoJSON Feature の作成
+            feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon" if is_closed and len(unique_coords) >= 4 else "LineString",
+                    "coordinates": [unique_coords] if is_closed and len(unique_coords) >= 4 else unique_coords
+                },
+                "properties": {
+                    "layer": str(entity.dxf.layer),
+                    "color": int(entity.dxf.color),
+                    "dxftype": str(dxftype),
+                    "elevation": base_elevation,
+                    **z_stats
+                }
+            }
+
+            logging.info(f"[高さ追跡] フィーチャ作成完了: {z_stats}")
+            return feature
+
+        except Exception as e:
+            logging.error(f"[高さ追跡] ポリライン処理エラー: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return None
 
     def _extract_line(self, entity) -> LineString:
         """LINEエンティティ処理"""
         start = entity.dxf.start
         end = entity.dxf.end
         return LineString([(start.x, start.y, start.z), (end.x, end.y, end.z)])
+
+    def _extract_curve(self, entity) -> Optional[Dict[str, Any]]:
+        """CIRCLE/ARCエンティティの処理"""
+        try:
+            dxftype = entity.dxftype()
+            center = entity.dxf.center
+            radius = entity.dxf.radius
+            
+            if dxftype == "CIRCLE":
+                # 円を近似する点の数（精度）
+                num_points = 32
+                points = []
+                for i in range(num_points + 1):
+                    angle = (i * 2 * math.pi) / num_points
+                    x = center.x + radius * math.cos(angle)
+                    y = center.y + radius * math.sin(angle)
+                    z = center.z
+                    points.append([x, y, z])
+                
+                return {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [points]
+                    },
+                    "properties": {
+                        "layer": str(entity.dxf.layer),
+                        "color": int(entity.dxf.color),
+                        "dxftype": str(dxftype),
+                        "radius": radius
+                    }
+                }
+                
+            elif dxftype == "ARC":
+                start_angle = math.radians(entity.dxf.start_angle)
+                end_angle = math.radians(entity.dxf.end_angle)
+                
+                # 終了角度が開始角度より小さい場合、360度を加算
+                if end_angle < start_angle:
+                    end_angle += 2 * math.pi
+                    
+                # 円弧を近似する点の数（精度）
+                num_points = 16
+                points = []
+                
+                for i in range(num_points + 1):
+                    angle = start_angle + (i * (end_angle - start_angle)) / num_points
+                    x = center.x + radius * math.cos(angle)
+                    y = center.y + radius * math.sin(angle)
+                    z = center.z
+                    points.append([x, y, z])
+                
+                return {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": points
+                    },
+                    "properties": {
+                        "layer": str(entity.dxf.layer),
+                        "color": int(entity.dxf.color),
+                        "dxftype": str(dxftype),
+                        "radius": radius,
+                        "start_angle": entity.dxf.start_angle,
+                        "end_angle": entity.dxf.end_angle
+                    }
+                }
+                
+        except Exception as e:
+            logging.error(f"円/円弧の処理エラー: {str(e)}")
+            return None
 
     def process(self) -> List[Dict[str, Any]]:
         """全エンティティの処理"""
@@ -284,36 +454,43 @@ class CoordinateTransformer:
             always_xy=True
         )
 
-    def transform_geometry(self, geometry):
-        """ジオメトリの座標変換"""
+    def transform_geometry(self, feature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """GeoJSON形式のジオメトリを変換"""
         try:
-            if geometry.is_empty:
-                return geometry
-            
-            # 3次元座標変換
-            def transform_coords(coords):
-                x, y, *z = zip(*coords)
-                z = z[0] if z else [0]*len(x)
-                new_x, new_y = self.transformer.transform(x, y)
-                return list(zip(new_x, new_y, z))
+            if not feature or "geometry" not in feature:
+                return None
 
-            if isinstance(geometry, Point):
-                x, y = self.transformer.transform(geometry.x, geometry.y)
-                return Point(x, y, geometry.z)
+            coords = feature["geometry"]["coordinates"]
+            geom_type = feature["geometry"]["type"]
             
-            elif isinstance(geometry, LineString):
-                return LineString(transform_coords(geometry.coords))
+            if geom_type == "Polygon":
+                transformed_coords = []
+                for ring in coords:
+                    transformed_ring = []
+                    for coord in ring:
+                        if len(coord) != 3:
+                            continue
+                        x, y, z = coord
+                        new_x, new_y = self.transformer.transform(x, y)
+                        transformed_ring.append([new_x, new_y, z])  # Z座標を保持
+                    transformed_coords.append(transformed_ring)
+                feature["geometry"]["coordinates"] = transformed_coords
+                
+            elif geom_type == "LineString":
+                transformed_coords = []
+                for coord in coords:
+                    if len(coord) != 3:
+                        continue
+                    x, y, z = coord
+                    new_x, new_y = self.transformer.transform(x, y)
+                    transformed_coords.append([new_x, new_y, z])  # Z座標を保持
+                feature["geometry"]["coordinates"] = transformed_coords
             
-            elif isinstance(geometry, Polygon):
-                exterior = transform_coords(geometry.exterior.coords)
-                interiors = [transform_coords(ring.coords) for ring in geometry.interiors]
-                return Polygon(exterior, interiors)
+            return feature
             
-            return geometry
-        
         except Exception as e:
             logging.error(f"座標変換エラー: {str(e)}")
-            return geometry
+            return None
 
 #########################
 # メイン処理
@@ -330,9 +507,6 @@ def process_geometry(geometry):
 def process_dxf_file(dxf_path: str, epsg: int, output_crs: str) -> None:
     """DXFファイルを処理"""
     try:
-        logging.info(f"DXF処理開始: {dxf_path}")
-        
-        # DXFファイル処理
         processor = DXFProcessor(dxf_path)
         features = processor.process()
         
@@ -342,39 +516,29 @@ def process_dxf_file(dxf_path: str, epsg: int, output_crs: str) -> None:
             
         # 座標変換
         transformer = CoordinateTransformer(epsg, output_crs)
+        transformed_features = []
         for feature in features:
-            feature['geometry'] = transformer.transform_geometry(feature['geometry'])
+            transformed_feature = transformer.transform_geometry(feature)
+            if transformed_feature:
+                transformed_features.append(transformed_feature)
         
         # GeoJSONファイル作成
-        gdf = gpd.GeoDataFrame(
-            [f['properties'] for f in features],
-            geometry=[f['geometry'] for f in features],
-            crs=output_crs
-        )
+        output_path = dxf_path.rsplit('.', 1)[0] + f'_epsg{output_crs.split(":")[-1]}.geojson'
         
-        # 出力ファイル名設定
-        output_epsg = output_crs.replace("EPSG:", "")
-        output_dir = os.path.dirname(dxf_path)
-        input_filename = os.path.basename(dxf_path)
-        output_filename = input_filename.replace(".dxf", f"_epsg{output_epsg}.geojson")
-        output_path = os.path.join(output_dir, output_filename)
-        
-        # GeoJSON形式に変換
-        geojson_dict = {
+        # GeoJSON形式で保存
+        geojson_data = {
             "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "geometry": mapping(geom),
-                    "properties": props
+            "features": transformed_features,
+            "crs": {
+                "type": "name",
+                "properties": {
+                    "name": output_crs
                 }
-                for geom, props in zip(gdf.geometry, gdf.drop('geometry', axis=1).to_dict('records'))
-            ]
+            }
         }
         
-        # JSONファイルとして保存
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(geojson_dict, f, ensure_ascii=False, indent=2)
+            json.dump(geojson_data, f, ensure_ascii=False, indent=2)
             
         logging.info(f"出力完了: {output_path}")
         
